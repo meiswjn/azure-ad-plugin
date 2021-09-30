@@ -5,11 +5,11 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
+import hudson.ProxyConfiguration;
 import hudson.model.AbstractItem;
 import hudson.model.Action;
 import hudson.model.Computer;
 import hudson.model.RootAction;
-import hudson.model.User;
 import hudson.security.AccessControlled;
 import hudson.security.SecurityRealm;
 import jenkins.model.Jenkins;
@@ -26,6 +26,9 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.stapler.StaplerProxy;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerResponse;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Collection;
@@ -41,13 +44,13 @@ import static com.microsoft.jenkins.azuread.AzureSecurityRealm.addProxyToHttpCli
 @Extension
 @Restricted(NoExternalUse.class)
 public class GraphProxy implements RootAction, StaplerProxy {
-    private static final OkHttpClient CLIENT = addProxyToHttpClientIfRequired(new OkHttpClient().newBuilder()).build();
     private static final int TEN = 10;
     private final Cache<String, AccessToken> tokenCache = Caffeine.newBuilder()
             .expireAfterWrite(TEN, TimeUnit.MINUTES)
             .build();
 
     private AccessControlled accessControlled;
+    private static final OkHttpClient DEFAULT_CLIENT = new OkHttpClient();
 
     @Override
     public String getIconFileName() {
@@ -126,13 +129,14 @@ public class GraphProxy implements RootAction, StaplerProxy {
     }
 
     private void proxy(StaplerRequest request, StaplerResponse response) throws IOException {
+        OkHttpClient client = getClient();
         String baseUrl = getBaseUrl();
         String token = getToken();
 
         String url = buildUrl(request, baseUrl);
         Request okRequest = buildRequest(request, token, url);
 
-        try (Response okResp = CLIENT.newCall(okRequest).execute()) {
+        try (Response okResp = client.newCall(okRequest).execute()) {
             String contentType = okResp.header("Content-Type", "application/json");
 
             response.setContentType(contentType);
@@ -153,6 +157,17 @@ public class GraphProxy implements RootAction, StaplerProxy {
                 }
             }
         }
+    }
+
+    /**
+     * Prefers the default client for performance, proxy users will get a new instance each time.
+     */
+    private OkHttpClient getClient() {
+        ProxyConfiguration proxyConfiguration = Jenkins.get().getProxy();
+        if (proxyConfiguration != null && StringUtils.isNotBlank(proxyConfiguration.getName())) {
+            return addProxyToHttpClientIfRequired(new OkHttpClient().newBuilder()).build();
+        }
+        return DEFAULT_CLIENT;
     }
 
     private String getToken() {
@@ -223,11 +238,12 @@ public class GraphProxy implements RootAction, StaplerProxy {
         // /me doesn't work for service principals but we can use the current logged in user instead
         // this is also used for /me/people to get the people the current logged in user works with
         if (path.startsWith("/me")) {
-            User currentUser = User.current();
-            if (currentUser == null) {
-                throw new IllegalStateException("User must be logged in here");
+            Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+
+            if (authentication instanceof AzureAuthenticationToken) {
+                String objectID = ((AzureAuthenticationToken) authentication).getAzureAdUser().getObjectID();
+                path = path.replace("me", "users/" + objectID);
             }
-            path = path.replace("me", "users/" + currentUser.getId());
         }
 
         builder.append(path);
